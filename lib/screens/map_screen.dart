@@ -151,6 +151,28 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     }
   }
 
+  Future<void> _performRawSearch(String query) async {
+    final text = query.trim();
+    if (text.isEmpty) return;
+
+    final suggestions = await _geocodingService.getSuggestions(text, _currentPosition);
+    if (suggestions.isNotEmpty) {
+      final bestMatch = suggestions.first;
+      setState(() {
+        _destination = bestMatch.coordinates;
+        _destinationName = bestMatch.name;
+      });
+      _mapController.move(bestMatch.coordinates, 14.0);
+      FocusManager.instance.primaryFocus?.unfocus();
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Address not found')),
+        );
+      }
+    }
+  }
+
   @override
   void dispose() {
     _positionStream?.cancel();
@@ -181,7 +203,23 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
         elevation: 2,
         iconTheme: const IconThemeData(color: Colors.white),
       ),
-      body: Stack(
+      body: _currentPosition == null
+        ? Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(24),
+                  child: Image.asset('assets/app_logo.jpeg', width: 120, height: 120),
+                ),
+                const SizedBox(height: 24),
+                const CircularProgressIndicator(color: Colors.blue),
+                const SizedBox(height: 16),
+                Text('Acquiring GPS Signal...', style: TextStyle(color: Colors.grey.shade700, fontSize: 16, fontWeight: FontWeight.w500)),
+              ],
+            ),
+          )
+        : Stack(
         children: [
           // MAP LAYER
           FlutterMap(
@@ -281,10 +319,20 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             right: 70, // Leave space for re-center button
             child: Autocomplete<SearchSuggestion>(
               optionsBuilder: (TextEditingValue textEditingValue) async {
-                if (textEditingValue.text.isEmpty) {
+                final currentText = textEditingValue.text;
+                if (currentText.length < 3) {
                   return const Iterable<SearchSuggestion>.empty();
                 }
-                return await _geocodingService.getSuggestions(textEditingValue.text);
+                
+                // Debounce: Wait 600ms before calling the API
+                await Future.delayed(const Duration(milliseconds: 300));
+                
+                // If the user kept typing during the wait, abort this request
+                if (_autoCompleteController != null && _autoCompleteController!.text != currentText) {
+                  return const Iterable<SearchSuggestion>.empty();
+                }
+                
+                return await _geocodingService.getSuggestions(currentText, _currentPosition);
               },
               onSelected: (SearchSuggestion selection) {
                 setState(() {
@@ -303,13 +351,38 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                   child: TextField(
                     controller: textEditingController,
                     focusNode: focusNode,
-                    decoration: const InputDecoration(
+                    decoration: InputDecoration(
                       hintText: 'Search destination...',
                       border: InputBorder.none,
-                      contentPadding: EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-                      suffixIcon: Icon(Icons.search, color: Colors.blue),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                      suffixIcon: ValueListenableBuilder<TextEditingValue>(
+                        valueListenable: textEditingController,
+                        builder: (context, value, child) {
+                          if (value.text.isEmpty) {
+                            return IconButton(
+                              icon: const Icon(Icons.search, color: Colors.blue),
+                              onPressed: () {
+                                _performRawSearch(textEditingController.text);
+                              },
+                            );
+                          } else {
+                            return IconButton(
+                              icon: const Icon(Icons.close, color: Colors.grey),
+                              onPressed: () {
+                                textEditingController.clear();
+                                setState(() {
+                                  _destination = null;
+                                });
+                              },
+                            );
+                          }
+                        },
+                      ),
                     ),
-                    onSubmitted: (_) => onFieldSubmitted(),
+                    onSubmitted: (val) {
+                      _performRawSearch(val);
+                      onFieldSubmitted();
+                    },
                   ),
                 );
               },
