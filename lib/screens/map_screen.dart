@@ -7,6 +7,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import '../services/location_service.dart';
 import '../services/geocoding_service.dart';
+import '../services/routing_service.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -19,10 +20,14 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   final MapController _mapController = MapController();
   final LocationService _locationService = LocationService();
   final GeocodingService _geocodingService = GeocodingService();
+  final RoutingService _routingService = RoutingService();
   
   TextEditingController? _autoCompleteController;
   String _destinationName = '';
   LatLng? _destination;
+  List<LatLng> _routePoints = [];
+  String _eta = '';
+  String _distance = '';
   
   LatLng? _currentPosition;
   Position? _fullPositionData;
@@ -234,6 +239,16 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.sih.idr',
               ),
+              if (_routePoints.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _routePoints,
+                      color: Colors.blue.shade600,
+                      strokeWidth: 6.0,
+                    ),
+                  ],
+                ),
               if (_currentPosition != null || _destination != null)
                 MarkerLayer(
                   markers: [
@@ -452,7 +467,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                               IconButton(
                                 icon: const Icon(Icons.close, color: Colors.grey),
                                 onPressed: () {
-                                  setState(() => _destination = null);
+                                  setState(() {
+                                    _destination = null;
+                                    _routePoints.clear();
+                                    _eta = '';
+                                    _distance = '';
+                                  });
                                   _autoCompleteController?.clear();
                                 },
                               ),
@@ -460,6 +480,21 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                           ),
                           const SizedBox(height: 4),
                           Text('${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}', style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                          if (_eta.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 16.0, bottom: 8.0),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.access_time, color: Colors.green, size: 20),
+                                  const SizedBox(width: 8),
+                                  Text(_eta, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.green)),
+                                  const SizedBox(width: 16),
+                                  const Icon(Icons.route, color: Colors.blue, size: 20),
+                                  const SizedBox(width: 8),
+                                  Text(_distance, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.blue)),
+                                ],
+                              ),
+                            ),
                           const SizedBox(height: 24),
                           SizedBox(
                             width: double.infinity,
@@ -473,8 +508,36 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                               ),
                               icon: const Icon(Icons.directions, size: 24),
                               label: const Text('Start Navigation', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                              onPressed: () {
-                                // TODO: Implement Step 3 Routing here
+                              onPressed: () async {
+                                if (_currentPosition == null || _destination == null) return;
+                                
+                                final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
+                                if (routeData != null && mounted) {
+                                  setState(() {
+                                    _routePoints = routeData.points;
+                                    
+                                    // Calculate ETA in minutes
+                                    final minutes = (routeData.duration / 60).round();
+                                    _eta = '$minutes min';
+                                    
+                                    // Calculate Distance
+                                    if (routeData.distance > 1000) {
+                                      _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
+                                    } else {
+                                      _distance = '${routeData.distance.round()} m';
+                                    }
+                                  });
+                                  
+                                  // Zoom out to show the whole route
+                                  final bounds = LatLngBounds.fromPoints(_routePoints);
+                                  _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
+                                } else {
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Failed to calculate route')),
+                                    );
+                                  }
+                                }
                               },
                             ),
                           ),
