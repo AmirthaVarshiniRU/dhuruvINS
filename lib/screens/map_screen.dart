@@ -28,6 +28,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   List<LatLng> _routePoints = [];
   String _eta = '';
   String _distance = '';
+  bool _isNavigating = false;
   
   LatLng? _currentPosition;
   Position? _fullPositionData;
@@ -460,87 +461,116 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                               decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)),
                             ),
                           ),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Expanded(child: Text(_destinationName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
-                              IconButton(
-                                icon: const Icon(Icons.close, color: Colors.grey),
-                                onPressed: () {
-                                  setState(() {
-                                    _destination = null;
-                                    _routePoints.clear();
-                                    _eta = '';
-                                    _distance = '';
-                                  });
-                                  _autoCompleteController?.clear();
+                          if (!_isNavigating) ...[
+                            // --- PREVIEW MODE ---
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Expanded(child: Text(_destinationName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
+                                IconButton(
+                                  icon: const Icon(Icons.close, color: Colors.grey),
+                                  onPressed: () {
+                                    setState(() {
+                                      _destination = null;
+                                      _routePoints.clear();
+                                      _eta = '';
+                                      _distance = '';
+                                      _isNavigating = false;
+                                    });
+                                    _autoCompleteController?.clear();
+                                  },
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            Text('${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}', style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                            const SizedBox(height: 8),
+                            Text('Ready for navigation.', style: TextStyle(color: Colors.blue.shade600, fontSize: 14, fontWeight: FontWeight.w500)),
+                            const SizedBox(height: 24),
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.blue.shade700,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(vertical: 16),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  elevation: 0,
+                                ),
+                                icon: const Icon(Icons.directions, size: 24),
+                                label: const Text('Start Navigation', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                onPressed: () async {
+                                  if (_currentPosition == null || _destination == null) return;
+                                  
+                                  final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
+                                  if (routeData != null && mounted) {
+                                    setState(() {
+                                      _routePoints = routeData.points;
+                                      final minutes = (routeData.duration / 60).round();
+                                      _eta = '$minutes min';
+                                      if (routeData.distance > 1000) {
+                                        _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
+                                      } else {
+                                        _distance = '${routeData.distance.round()} m';
+                                      }
+                                      _isNavigating = true; // Switch to Navigation Mode!
+                                    });
+                                    
+                                    final bounds = LatLngBounds.fromPoints(_routePoints);
+                                    _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
+                                  } else {
+                                    if (mounted) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(content: Text('Failed to calculate route')),
+                                      );
+                                    }
+                                  }
                                 },
                               ),
-                            ],
-                          ),
-                          const SizedBox(height: 4),
-                          Text('${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}', style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
-                          if (_eta.isNotEmpty)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 16.0, bottom: 8.0),
-                              child: Row(
-                                children: [
-                                  const Icon(Icons.access_time, color: Colors.green, size: 20),
-                                  const SizedBox(width: 8),
-                                  Text(_eta, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.green)),
-                                  const SizedBox(width: 16),
-                                  const Icon(Icons.route, color: Colors.blue, size: 20),
-                                  const SizedBox(width: 8),
-                                  Text(_distance, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.blue)),
-                                ],
-                              ),
                             ),
-                          const SizedBox(height: 24),
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.blue.shade700,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 16),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                elevation: 0,
-                              ),
-                              icon: const Icon(Icons.directions, size: 24),
-                              label: const Text('Start Navigation', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                              onPressed: () async {
-                                if (_currentPosition == null || _destination == null) return;
-                                
-                                final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
-                                if (routeData != null && mounted) {
-                                  setState(() {
-                                    _routePoints = routeData.points;
-                                    
-                                    // Calculate ETA in minutes
-                                    final minutes = (routeData.duration / 60).round();
-                                    _eta = '$minutes min';
-                                    
-                                    // Calculate Distance
-                                    if (routeData.distance > 1000) {
-                                      _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
-                                    } else {
-                                      _distance = '${routeData.distance.round()} m';
-                                    }
-                                  });
-                                  
-                                  // Zoom out to show the whole route
-                                  final bounds = LatLngBounds.fromPoints(_routePoints);
-                                  _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
-                                } else {
-                                  if (mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('Failed to calculate route')),
-                                    );
-                                  }
-                                }
-                              },
+                          ] else ...[
+                            // --- ACTIVE NAVIGATION MODE ---
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        crossAxisAlignment: CrossAxisAlignment.baseline,
+                                        textBaseline: TextBaseline.alphabetic,
+                                        children: [
+                                          Text(_eta, style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Colors.green)),
+                                          const SizedBox(width: 12),
+                                          Text(_distance, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: Colors.blue)),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text('Navigating to: $_destinationName', style: TextStyle(color: Colors.grey.shade700, fontSize: 16)),
+                                    ],
+                                  ),
+                                ),
+                                  IconButton(
+                                    icon: const Icon(Icons.close, color: Colors.grey, size: 32),
+                                    onPressed: () {
+                                      // Cancel navigation, go back to preview mode
+                                      setState(() {
+                                        _isNavigating = false;
+                                        _routePoints.clear();
+                                        _eta = '';
+                                        _distance = '';
+                                      });
+                                      if (_destination != null) {
+                                        _mapController.move(_destination!, 14.0);
+                                      }
+                                    },
+                                  ),
+                              ],
                             ),
-                          ),
+                            const SizedBox(height: 16),
+                          ],
                         ],
                       ),
                     ),
