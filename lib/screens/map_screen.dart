@@ -20,9 +20,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   final LocationService _locationService = LocationService();
   final GeocodingService _geocodingService = GeocodingService();
   
-  final TextEditingController _searchController = TextEditingController();
+  TextEditingController? _autoCompleteController;
+  String _destinationName = '';
   LatLng? _destination;
-  bool _isSearching = false;
   
   LatLng? _currentPosition;
   Position? _fullPositionData;
@@ -151,29 +151,8 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     }
   }
 
-  Future<void> _searchDestination() async {
-    final query = _searchController.text.trim();
-    if (query.isEmpty) return;
-
-    setState(() { _isSearching = true; });
-    final coords = await _geocodingService.getCoordinates(query);
-    setState(() { _isSearching = false; });
-
-    if (coords != null) {
-      setState(() { _destination = coords; });
-      _mapController.move(coords, 14.0);
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Address not found')),
-        );
-      }
-    }
-  }
-
   @override
   void dispose() {
-    _searchController.dispose();
     _positionStream?.cancel();
     _accelSub?.cancel();
     _userAccelSub?.cancel();
@@ -300,25 +279,66 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             top: 20,
             left: 20,
             right: 70, // Leave space for re-center button
-            child: Material(
-              elevation: 4,
-              borderRadius: BorderRadius.circular(30),
-              color: Colors.white,
-              child: TextField(
-                controller: _searchController,
-                decoration: InputDecoration(
-                  hintText: 'Search destination...',
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-                  suffixIcon: _isSearching 
-                    ? const Padding(padding: EdgeInsets.all(12), child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)))
-                    : IconButton(
-                        icon: const Icon(Icons.search, color: Colors.blue),
-                        onPressed: _searchDestination,
+            child: Autocomplete<SearchSuggestion>(
+              optionsBuilder: (TextEditingValue textEditingValue) async {
+                if (textEditingValue.text.isEmpty) {
+                  return const Iterable<SearchSuggestion>.empty();
+                }
+                return await _geocodingService.getSuggestions(textEditingValue.text);
+              },
+              onSelected: (SearchSuggestion selection) {
+                setState(() {
+                  _destination = selection.coordinates;
+                  _destinationName = selection.name;
+                });
+                _mapController.move(selection.coordinates, 14.0);
+                FocusManager.instance.primaryFocus?.unfocus();
+              },
+              fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
+                _autoCompleteController = textEditingController;
+                return Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(30),
+                  color: Colors.white,
+                  child: TextField(
+                    controller: textEditingController,
+                    focusNode: focusNode,
+                    decoration: const InputDecoration(
+                      hintText: 'Search destination...',
+                      border: InputBorder.none,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                      suffixIcon: Icon(Icons.search, color: Colors.blue),
+                    ),
+                    onSubmitted: (_) => onFieldSubmitted(),
+                  ),
+                );
+              },
+              optionsViewBuilder: (context, onSelected, options) {
+                return Align(
+                  alignment: Alignment.topLeft,
+                  child: Material(
+                    elevation: 4,
+                    borderRadius: BorderRadius.circular(12),
+                    color: Colors.white,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(maxHeight: 250, maxWidth: MediaQuery.of(context).size.width - 90),
+                      child: ListView.builder(
+                        padding: EdgeInsets.zero,
+                        shrinkWrap: true,
+                        itemCount: options.length,
+                        itemBuilder: (BuildContext context, int index) {
+                          final SearchSuggestion option = options.elementAt(index);
+                          return ListTile(
+                            leading: const Icon(Icons.location_on, color: Colors.blue),
+                            title: Text(option.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            onTap: () => onSelected(option),
+                          );
+                        },
                       ),
-                ),
-                onSubmitted: (_) => _searchDestination(),
-              ),
+                    ),
+                  ),
+                );
+              },
             ),
           ),
 
@@ -355,12 +375,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              Expanded(child: Text(_searchController.text, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
+                              Expanded(child: Text(_destinationName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
                               IconButton(
                                 icon: const Icon(Icons.close, color: Colors.grey),
                                 onPressed: () {
                                   setState(() => _destination = null);
-                                  _searchController.clear();
+                                  _autoCompleteController?.clear();
                                 },
                               ),
                             ],

@@ -2,33 +2,55 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
-class GeocodingService {
-  static const String _baseUrl = 'https://nominatim.openstreetmap.org/search';
+class SearchSuggestion {
+  final String name;
+  final LatLng coordinates;
+  SearchSuggestion({required this.name, required this.coordinates});
+  
+  @override
+  String toString() => name; // Helps Autocomplete widget display the name
+}
 
-  /// Searches for an address and returns its LatLng coordinates.
-  Future<LatLng?> getCoordinates(String address) async {
+class GeocodingService {
+  static const String _photonUrl = 'https://photon.komoot.io/api';
+
+  /// Fetches autocomplete suggestions from Photon API
+  Future<List<SearchSuggestion>> getSuggestions(String query) async {
+    if (query.isEmpty) return [];
+    
     try {
-      // Create the API URL. format=json returns data we can parse, limit=1 gives the best result.
-      final url = Uri.parse('$_baseUrl?q=${Uri.encodeComponent(address)}&format=json&limit=1');
-      
-      // Nominatim requires a user-agent to identify who is making the request
-      final response = await http.get(url, headers: {
-        'User-Agent': 'com.sih.idr', 
-      });
+      final url = Uri.parse('$_photonUrl/?q=${Uri.encodeComponent(query)}&limit=5');
+      final response = await http.get(url);
 
       if (response.statusCode == 200) {
-        final List data = json.decode(response.body);
-        if (data.isNotEmpty) {
-          // Parse the latitude and longitude strings into doubles
-          final lat = double.parse(data[0]['lat']);
-          final lon = double.parse(data[0]['lon']);
-          return LatLng(lat, lon);
-        }
+        final data = json.decode(response.body);
+        final List features = data['features'] ?? [];
+        
+        return features.map((f) {
+          final props = f['properties'];
+          final coords = f['geometry']['coordinates']; // Photon returns [lon, lat]
+          final lat = coords[1];
+          final lon = coords[0];
+          
+          String displayName = props['name'] ?? 'Unknown Location';
+          
+          // Append city or state for context
+          if (props['city'] != null && props['city'] != props['name']) {
+            displayName += ', ${props['city']}';
+          } else if (props['state'] != null && props['state'] != props['name']) {
+             displayName += ', ${props['state']}';
+          }
+
+          return SearchSuggestion(
+            name: displayName,
+            coordinates: LatLng(lat, lon),
+          );
+        }).toList();
       }
-      return null;
+      return [];
     } catch (e) {
-      print('Geocoding error: $e');
-      return null;
+      print('Autocomplete error: $e');
+      return [];
     }
   }
 }
