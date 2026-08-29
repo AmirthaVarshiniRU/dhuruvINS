@@ -8,6 +8,14 @@ import 'package:sensors_plus/sensors_plus.dart';
 import '../services/location_service.dart';
 import '../services/geocoding_service.dart';
 import '../services/routing_service.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:dio/dio.dart';
+import 'package:dio_cache_interceptor/dio_cache_interceptor.dart';
+import 'package:dio_cache_interceptor_hive_store/dio_cache_interceptor_hive_store.dart';
+import 'package:flutter_map_cache/flutter_map_cache.dart';
+
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -29,6 +37,25 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   String _eta = '';
   String _distance = '';
   bool _isNavigating = false;
+
+  List<RouteInstruction> _routeInstructions = [];
+  bool _isActiveRouting = false;
+  bool _isAutoTracking = true;
+  int _currentStepIndex = 0;
+  double _distanceToNextTurn = 0.0;
+  
+  bool _isConnected = true;
+  StreamSubscription<InternetStatus>? _internetSub;
+  bool _hasCheckedInitialConnection = false;
+  
+  CacheStore? _cacheStore;
+  Dio? _dio;
+  bool _isDownloadingMap = false;
+  bool _hasPrefetchedHome = false;
+  double _downloadProgress = 0.0;
+  
+  final FlutterTts _flutterTts = FlutterTts();
+
   
   LatLng? _currentPosition;
   final ValueNotifier<Position?> _fullPositionData = ValueNotifier(null);
@@ -63,6 +90,47 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       vsync: this,
       duration: const Duration(seconds: 2),
     )..repeat();
+
+    _flutterTts.setLanguage("en-US");
+    _flutterTts.awaitSpeakCompletion(true);
+    
+    _internetSub = InternetConnection().onStatusChange.listen((InternetStatus status) {
+      if (mounted) {
+        final bool isConnectedNow = status == InternetStatus.connected;
+        if (!isConnectedNow && (_isConnected || !_hasCheckedInitialConnection)) {
+            showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                backgroundColor: Colors.red.shade800,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                title: const Row(
+                  children: [
+                    Icon(Icons.wifi_off, color: Colors.white),
+                    SizedBox(width: 12),
+                    Text('No Connection', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+                content: const Text(
+                  'Cannot connect, please check your network connection...',
+                  style: TextStyle(color: Colors.white, fontSize: 16),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('OK', style: TextStyle(color: Colors.white, fontSize: 16)),
+                  ),
+                ],
+              ),
+            );
+        }
+        setState(() {
+          _isConnected = isConnectedNow;
+          _hasCheckedInitialConnection = true;
+        });
+      }
+    });
+    
+    _initCacheStore();
     _initLocationTracking();
     _initSensors();
   }
@@ -168,12 +236,187 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     } catch (_) {}
   }
 
+
+  Future<void> _initCacheStore() async {
+    final dir = await getApplicationDocumentsDirectory();
+    _cacheStore = HiveCacheStore(dir.path, hiveBoxName: 'map_cache');
+    final cacheOptions = CacheOptions(
+      store: _cacheStore,
+      policy: CachePolicy.request,
+      hitCacheOnErrorExcept: [401, 403],
+      maxStale: const Duration(days: 7),
+    );
+    _dio = Dio()..interceptors.add(DioCacheInterceptor(options: cacheOptions));
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _speakInstruction(String text) async {
+    await _flutterTts.speak(text);
+  }
+
+
+  Future<void> _prefetchHomeTiles() async {
+    if (_currentPosition == null || _dio == null || _hasPrefetchedHome) return;
+    _hasPrefetchedHome = true;
+
+    final Set<String> tilesToDownload = {};
+    for (int z = 13; z <= 16; z++) {
+      final n = math.pow(2, z);
+      final latRad = _currentPosition!.latitude * math.pi / 180;
+      final centerX = ((_currentPosition!.longitude + 180.0) / 360.0 * n).floor();
+      final centerY = ((1.0 - math.log(math.tan(latRad) + (1 / math.cos(latRad))) / math.pi) / 2.0 * n).floor();
+      
+      // 3x3 grid around center tile to cover >500m radius
+      for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+          tilesToDownload.add('https://tile.openstreetmap.org///.png');
+        }
+      }
+    }
+
+    for (var url in tilesToDownload) {
+      try { await _dio!.get(url); } catch (_) {}
+    }
+  }
+
+  Future<void> _prefetchMapTiles() async {
+    if (_routePoints.isEmpty || _dio == null) return;
+    setState(() {
+      _isDownloadingMap = true;
+      _downloadProgress = 0.0;
+    });
+
+    final Set<String> tilesToDownload = {};
+    for (var point in _routePoints) {
+      for (int z = 13; z <= 16; z++) {
+        final n = math.pow(2, z);
+        final latRad = point.latitude * math.pi / 180;
+        final x = ((point.longitude + 180.0) / 360.0 * n).floor();
+        final y = ((1.0 - math.log(math.tan(latRad) + (1 / math.cos(latRad))) / math.pi) / 2.0 * n).floor();
+        tilesToDownload.add('https://tile.openstreetmap.org/$z/$x/$y.png');
+      }
+    }
+
+    int completed = 0;
+    final total = tilesToDownload.length;
+    for (var url in tilesToDownload) {
+      try {
+        await _dio!.get(url);
+      } catch (_) {}
+      completed++;
+      if (mounted) {
+        setState(() {
+          _downloadProgress = completed / total;
+        });
+      }
+    }
+    
+    if (mounted) {
+      setState(() {
+        _isDownloadingMap = false;
+      });
+    }
+  }
+
+
+  String _getArrivalTime(String eta) {
+    if (eta.isEmpty) return '';
+    try {
+      int minutes = int.parse(eta.replaceAll(RegExp(r'[^0-9]'), ''));
+      DateTime arrival = DateTime.now().add(Duration(minutes: minutes));
+      String hour = arrival.hour > 12 ? (arrival.hour - 12).toString() : (arrival.hour == 0 ? '12' : arrival.hour.toString());
+      String minute = arrival.minute.toString().padLeft(2, '0');
+      String ampm = arrival.hour >= 12 ? 'pm' : 'am';
+      return '$hour:$minute $ampm';
+    } catch (_) {
+      return '';
+    }
+  }
+
   void _onPhoneGnss(Position position) {
     if (!mounted) return;
     _fullPositionData.value = position;
+
+    // Filter out small GPS drifts when stationary to stop the map from vibrating
+    if (_currentPosition != null) {
+      double dist = Geolocator.distanceBetween(
+        _currentPosition!.latitude, _currentPosition!.longitude,
+        position.latitude, position.longitude,
+      );
+      // If we moved less than 3 meters and speed is near zero, ignore the drift
+      if (dist < 3.0 && position.speed < 1.0) {
+        return; 
+      }
+    }
+
     setState(() {
       _currentPosition = LatLng(position.latitude, position.longitude);
     });
+    
+    if (!_hasPrefetchedHome) {
+      _prefetchHomeTiles();
+    }
+    
+    setState(() {
+      
+      if (_routeInstructions.isNotEmpty && _currentStepIndex < _routeInstructions.length) {
+        if (_routePoints.isNotEmpty) {
+          int closestIndex = 0;
+          double minDistance = double.infinity;
+          int searchLimit = math.min(20, _routePoints.length);
+          for (int i = 0; i < searchLimit; i++) {
+            double dist = Geolocator.distanceBetween(
+              _currentPosition!.latitude, _currentPosition!.longitude,
+              _routePoints[i].latitude, _routePoints[i].longitude,
+            );
+            if (dist < minDistance) {
+              minDistance = dist;
+              closestIndex = i;
+            }
+          }
+          if (minDistance < 100) {
+            _routePoints = _routePoints.sublist(closestIndex).toList();
+          }
+        }
+
+        final nextStep = _routeInstructions[_currentStepIndex];
+        _distanceToNextTurn = Geolocator.distanceBetween(
+          _currentPosition!.latitude, _currentPosition!.longitude,
+          nextStep.maneuverLocation.latitude, nextStep.maneuverLocation.longitude,
+        );
+        
+        double remainingTotal = _distanceToNextTurn;
+        for (int i = _currentStepIndex + 1; i < _routeInstructions.length; i++) {
+          remainingTotal += _routeInstructions[i].distance;
+        }
+        if (remainingTotal > 1000) {
+          _distance = '${(remainingTotal / 1000).toStringAsFixed(1)} km';
+        } else {
+          _distance = '${remainingTotal.round()} m';
+        }
+        
+        // Dynamically update ETA based on remaining distance and current speed (fallback to 30km/h)
+        double currentSpeed = position.speed > 5.0 ? position.speed : 8.33; // m/s
+        int remainingSeconds = (remainingTotal / currentSpeed).round();
+        if (remainingSeconds > 3600) {
+          _eta = '${(remainingSeconds / 3600).floor()} hr ${(remainingSeconds % 3600) ~/ 60} min';
+        } else {
+          _eta = '${(remainingSeconds / 60).ceil()} min';
+        }
+
+        if (_distanceToNextTurn < 50.0) {
+          if (_isActiveRouting) _speakInstruction(nextStep.instruction);
+          _currentStepIndex++;
+        }
+        
+        if (_isAutoTracking && _mapReady) {
+          _moveMapSafely(_currentPosition!, _mapController.camera.zoom);
+        }
+      } else if (_isAutoTracking && _mapReady) {
+        _moveMapSafely(_currentPosition!, _mapController.camera.zoom);
+      }
+    });
+
   }
 
   Future<void> _performRawSearch(String query) async {
@@ -200,6 +443,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
   @override
   void dispose() {
+
+    _internetSub?.cancel();
+    _flutterTts.stop();
     _positionStream?.cancel();
     _accelSub?.cancel();
     _userAccelSub?.cancel();
@@ -228,6 +474,26 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
         backgroundColor: Colors.blue.shade900,
         elevation: 2,
         iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          Center(
+            child: Container(
+              margin: const EdgeInsets.only(right: 16),
+              width: 12,
+              height: 12,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isConnected ? Colors.greenAccent : Colors.redAccent,
+                boxShadow: [
+                  BoxShadow(
+                    color: _isConnected ? Colors.greenAccent.withValues(alpha: 0.5) : Colors.redAccent.withValues(alpha: 0.5),
+                    blurRadius: 6,
+                    spreadRadius: 2,
+                  )
+                ]
+              ),
+            ),
+          )
+        ],
       ),
       body: _currentPosition == null
         ? Center(
@@ -253,7 +519,14 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             options: MapOptions(
               initialCenter: _currentPosition ?? const LatLng(28.6139, 77.2090),
               initialZoom: 15.0,
-              interactionOptions: const InteractionOptions(flags: InteractiveFlag.all & ~InteractiveFlag.rotate),
+              maxZoom: 22.0,
+              minZoom: 3.0,
+              interactionOptions: const InteractionOptions(flags: InteractiveFlag.all),
+              onPositionChanged: (position, hasGesture) {
+                if (hasGesture && _isAutoTracking) {
+                  setState(() => _isAutoTracking = false);
+                }
+              },
               onMapReady: () {
                 _mapReady = true;
                 if (_currentPosition != null) {
@@ -262,15 +535,22 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               },
             ),
             children: [
+
               TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.sih.idr',
+                maxNativeZoom: 19,
+                maxZoom: 22,
+                tileProvider: _cacheStore != null ? CachedTileProvider(store: _cacheStore!) : null,
               ),
+
               if (_routePoints.isNotEmpty)
                 PolylineLayer(
                   polylines: [
                     Polyline(
-                      points: _routePoints,
+                      points: _isActiveRouting && _currentPosition != null && _routePoints.isNotEmpty
+                          ? [_currentPosition!, if (_routePoints.length > 1) ..._routePoints.sublist(1) else _routePoints[0]]
+                          : _routePoints,
                       color: Colors.blue.shade600,
                       strokeWidth: 6.0,
                     ),
@@ -303,7 +583,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                 Container(
                                   width: 18.0,
                                   height: 18.0,
-                                  decoration: const BoxDecoration(
+                                  decoration: BoxDecoration(
                                     shape: BoxShape.circle,
                                     color: Colors.white,
                                   ),
@@ -336,6 +616,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             ],
           ),
           
+          if (!_isActiveRouting && !_isAutoTracking)
           // RE-CENTER BUTTON
           Positioned(
             top: 20,
@@ -346,14 +627,35 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               foregroundColor: Colors.white,
               elevation: 4,
               onPressed: () {
+                setState(() => _isAutoTracking = true);
                 if (_currentPosition != null) {
-                  _mapController.move(_currentPosition!, 16.0);
+                  _mapController.moveAndRotate(_currentPosition!, 16.0, 0.0);
                 }
               },
               child: const Icon(Icons.my_location, size: 20),
             ),
           ),
+          
+          // COMPASS BUTTON (Normal Mode)
+          if (!_isActiveRouting)
+            Positioned(
+              top: 70,
+              right: 20,
+              child: FloatingActionButton(
+                mini: true,
+                backgroundColor: Colors.white,
+                foregroundColor: Colors.black87,
+                elevation: 4,
+                onPressed: () {
+                  if (_currentPosition != null) {
+                    _mapController.rotate(0.0);
+                  }
+                },
+                child: const Icon(Icons.explore, size: 20),
+              ),
+            ),
 
+          if (!_isActiveRouting)
           // SEARCH BAR
           Positioned(
             top: 20,
@@ -457,12 +759,81 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             ),
           ),
 
+
+          // Top Navigation Banner (Active Routing)
+          if (_isActiveRouting && _routeInstructions.isNotEmpty && _currentStepIndex < _routeInstructions.length)
+            Positioned(
+              top: MediaQuery.of(context).padding.top,
+              left: 12,
+              right: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0D5C54), // Dark green color
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 10, offset: Offset(0, 5))],
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.turn_left, color: Colors.white, size: 48),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('${_distanceToNextTurn.round()} m', style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+                          Text(
+                            _routeInstructions[_currentStepIndex].instruction, 
+                            style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w600),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Re-center FAB for Auto Tracking
+          if (_isActiveRouting && !_isAutoTracking)
+            Positioned(
+              bottom: MediaQuery.of(context).size.height / 2,
+              left: 16,
+              child: FloatingActionButton(
+                backgroundColor: Colors.white,
+                child: const Icon(Icons.my_location, color: Colors.blue),
+                onPressed: () {
+                  setState(() => _isAutoTracking = true);
+                  if (_currentPosition != null) {
+                    _mapController.moveAndRotate(_currentPosition!, 18.0, 0.0);
+                  }
+                },
+              ),
+            ),
+            
+          // COMPASS BUTTON (Active Routing)
+          if (_isActiveRouting)
+            Positioned(
+              bottom: (MediaQuery.of(context).size.height / 2) - 70,
+              left: 16,
+              child: FloatingActionButton(
+                backgroundColor: Colors.white,
+                child: const Icon(Icons.explore, color: Colors.black87),
+                onPressed: () {
+                  if (_currentPosition != null) {
+                    _mapController.rotate(0.0);
+                  }
+                },
+              ),
+            ),
           // BOTTOM SHEET FOR DESTINATION INFO
           if (_destination != null)
             DraggableScrollableSheet(
-              initialChildSize: 0.3,
+              initialChildSize: _isActiveRouting ? 0.22 : 0.38,
               minChildSize: 0.1,
-              maxChildSize: 0.4,
+              maxChildSize: _isActiveRouting ? 0.22 : 0.5,
               snap: true,
               builder: (context, scrollController) {
                 return Container(
@@ -487,75 +858,119 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                               decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)),
                             ),
                           ),
-                          if (!_isNavigating) ...[
-                            // --- PREVIEW MODE ---
+                          if (_routePoints.isEmpty) ...[
+                            // State 1: Selection Mode
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Expanded(child: Text(_destinationName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(_destinationName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.black)),
+                                      const SizedBox(height: 4),
+                                      Text('${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}', style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                                    ],
+                                  ),
+                                ),
                                 IconButton(
-                                  icon: const Icon(Icons.close, color: Colors.grey),
+                                  icon: const Icon(Icons.close, color: Colors.grey, size: 32),
                                   onPressed: () {
                                     setState(() {
                                       _destination = null;
                                       _routePoints.clear();
                                       _eta = '';
                                       _distance = '';
-                                      _isNavigating = false;
+                                      _isActiveRouting = false;
                                     });
                                     _autoCompleteController?.clear();
                                   },
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 4),
-                            Text('${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}', style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
-                            const SizedBox(height: 8),
-                            Text('Ready for navigation.', style: TextStyle(color: Colors.blue.shade600, fontSize: 14, fontWeight: FontWeight.w500)),
                             const SizedBox(height: 24),
-                            SizedBox(
-                              width: double.infinity,
-                              child: ElevatedButton.icon(
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.blue.shade700,
-                                  foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.symmetric(vertical: 16),
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                  elevation: 0,
-                                ),
-                                icon: const Icon(Icons.directions, size: 24),
-                                label: const Text('Start Navigation', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                                onPressed: () async {
-                                  if (_currentPosition == null || _destination == null) return;
-                                  
-                                  final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
-                                  if (routeData != null && mounted) {
-                                    setState(() {
-                                      _routePoints = routeData.points;
-                                      final minutes = (routeData.duration / 60).round();
-                                      _eta = '$minutes min';
-                                      if (routeData.distance > 1000) {
-                                        _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
-                                      } else {
-                                        _distance = '${routeData.distance.round()} m';
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: ElevatedButton.icon(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.blue.shade700,
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(vertical: 16),
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                      elevation: 0,
+                                    ),
+                                    icon: const Icon(Icons.map, size: 24),
+                                    label: const Text('Show Route', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                                    onPressed: () async {
+                                      if (_currentPosition == null || _destination == null) return;
+                                      
+                                      final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
+                                      if (routeData != null && mounted) {
+                                        setState(() {
+                                          _routePoints = routeData.points;
+                                          final minutes = (routeData.duration / 60).round();
+                                          _eta = '$minutes min';
+                                          if (routeData.distance > 1000) {
+                                            _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
+                                          } else {
+                                            _distance = '${routeData.distance.round()} m';
+                                          }
+                                          _routeInstructions = routeData.instructions;
+                                          _currentStepIndex = 0;
+                                          _isActiveRouting = false;
+                                        });
+                                        _prefetchMapTiles();
+                                        final bounds = LatLngBounds.fromPoints(_routePoints);
+                                        _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
                                       }
-                                      _isNavigating = true; // Switch to Navigation Mode!
-                                    });
-                                    
-                                    final bounds = LatLngBounds.fromPoints(_routePoints);
-                                    _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
-                                  } else {
-                                    if (mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(content: Text('Failed to calculate route')),
-                                      );
-                                    }
-                                  }
-                                },
-                              ),
+                                    },
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: ElevatedButton.icon(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.green.shade700,
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(vertical: 16),
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                      elevation: 0,
+                                    ),
+                                    icon: const Icon(Icons.play_arrow, size: 24),
+                                    label: const Text('Start Route', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                                    onPressed: () async {
+                                      if (_currentPosition == null || _destination == null) return;
+
+                                      final routeData = await _routingService.getRoute(_currentPosition!, _destination!);
+                                      if (routeData != null && mounted) {
+                                        setState(() {
+                                          _routePoints = routeData.points;
+                                          final minutes = (routeData.duration / 60).round();
+                                          _eta = '$minutes min';
+                                          if (routeData.distance > 1000) {
+                                            _distance = '${(routeData.distance / 1000).toStringAsFixed(1)} km';
+                                          } else {
+                                            _distance = '${routeData.distance.round()} m';
+                                          }
+                                          _routeInstructions = routeData.instructions;
+                                          _currentStepIndex = 0;
+                                          _isActiveRouting = true;
+                                        });
+                                        _prefetchMapTiles();
+                                        if (_routeInstructions.isNotEmpty) {
+                                          _speakInstruction(_routeInstructions[0].instruction);
+                                        }
+                                        _mapController.move(_currentPosition ?? _routePoints.first, 18.0);
+                                      }
+                                    },
+                                  ),
+                                ),
+                              ],
                             ),
-                          ] else ...[
-                            // --- ACTIVE NAVIGATION MODE ---
+                          ] else if (!_isActiveRouting) ...[
+                            // State 2: Preview Mode (Show Route clicked)
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -568,34 +983,88 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                         crossAxisAlignment: CrossAxisAlignment.baseline,
                                         textBaseline: TextBaseline.alphabetic,
                                         children: [
-                                          Text(_eta, style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Colors.green)),
+                                          Text(_eta, style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Color(0xFF4CAF50))),
                                           const SizedBox(width: 12),
-                                          Text(_distance, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: Colors.blue)),
+                                          Text(_distance, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600, color: Colors.blue)),
                                         ],
                                       ),
-                                      const SizedBox(height: 8),
-                                      Text('Navigating to: $_destinationName', style: TextStyle(color: Colors.grey.shade700, fontSize: 16)),
+                                      const SizedBox(height: 12),
+                                      Text('Navigating to: $_destinationName', style: TextStyle(color: Colors.grey.shade600, fontSize: 18)),
                                     ],
                                   ),
                                 ),
-                                  IconButton(
-                                    icon: const Icon(Icons.close, color: Colors.grey, size: 32),
-                                    onPressed: () {
-                                      // Cancel navigation, go back to preview mode
-                                      setState(() {
-                                        _isNavigating = false;
-                                        _routePoints.clear();
-                                        _eta = '';
-                                        _distance = '';
-                                      });
-                                      if (_destination != null) {
-                                        _mapController.move(_destination!, 14.0);
-                                      }
-                                    },
-                                  ),
+                                IconButton(
+                                  icon: const Icon(Icons.close, color: Colors.grey, size: 36),
+                                  onPressed: () {
+                                    setState(() {
+                                      _routePoints.clear();
+                                      _eta = '';
+                                      _distance = '';
+                                    });
+                                    if (_destination != null) {
+                                      _mapController.move(_destination!, 14.0);
+                                    }
+                                  },
+                                ),
                               ],
                             ),
-                            const SizedBox(height: 16),
+                          ] else ...[
+                            // State 3: Active Routing
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.close, color: Colors.grey, size: 36),
+                                  onPressed: () {
+                                    setState(() {
+                                      _isActiveRouting = false;
+                                      _routePoints.clear();
+                                      _eta = '';
+                                      _distance = '';
+                                    });
+                                  },
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.center,
+                                  children: [
+                                    Text(_eta, style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Colors.black)),
+                                    const SizedBox(height: 4),
+                                    Text('$_distance • ${_getArrivalTime(_eta)}', style: TextStyle(fontSize: 18, color: Colors.grey.shade700, fontWeight: FontWeight.w500)),
+                                  ],
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.alt_route, color: Colors.grey, size: 36),
+                                  onPressed: () {
+                                    showDialog(
+                                      context: context,
+                                      builder: (context) => AlertDialog(
+                                        backgroundColor: Colors.white,
+                                        title: const Text('Route Steps', style: TextStyle(color: Colors.black)),
+                                        content: SizedBox(
+                                          width: double.maxFinite,
+                                          child: ListView.builder(
+                                            shrinkWrap: true,
+                                            itemCount: _routeInstructions.length,
+                                            itemBuilder: (context, index) {
+                                              final step = _routeInstructions[index];
+                                              return ListTile(
+                                                leading: CircleAvatar(backgroundColor: Colors.blue.shade100, child: Text('${index + 1}', style: TextStyle(color: Colors.blue.shade900))),
+                                                title: Text(step.instruction, style: const TextStyle(color: Colors.black)),
+                                                subtitle: Text('${step.distance.round()} meters', style: TextStyle(color: Colors.grey.shade600)),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                        actions: [
+                                          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close', style: TextStyle(color: Colors.blue)))
+                                        ]
+                                      )
+                                    );
+                                  },
+                                ),
+                              ],
+                            ),
                           ],
                         ],
                       ),
