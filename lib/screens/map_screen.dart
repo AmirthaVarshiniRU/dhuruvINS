@@ -31,8 +31,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   bool _isNavigating = false;
   
   LatLng? _currentPosition;
-  Position? _fullPositionData;
+  final ValueNotifier<Position?> _fullPositionData = ValueNotifier(null);
   StreamSubscription<Position>? _positionStream;
+  bool _mapReady = false;
 
   // IMU Sensors (Now using ValueNotifiers for performance)
   final ValueNotifier<AccelerometerEvent?> _accel = ValueNotifier(null);
@@ -138,23 +139,41 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
   Future<void> _initLocationTracking() async {
     final hasPermission = await _locationService.checkAndRequestPermissions();
-    if (hasPermission) {
-      final initialPos = await _locationService.getCurrentPosition();
-      if (initialPos != null) {
-        setState(() {
-          _currentPosition = LatLng(initialPos.latitude, initialPos.longitude);
-          _fullPositionData = initialPos;
-        });
-        _mapController.move(_currentPosition!, 15.0);
-      }
+    if (!hasPermission || !mounted) return;
 
-      _positionStream = _locationService.getLocationStream().listen((Position position) {
-        setState(() {
-          _currentPosition = LatLng(position.latitude, position.longitude);
-          _fullPositionData = position;
+    _positionStream = _locationService.getLocationStream().listen(
+      _onPhoneGnss,
+      onError: (Object _, StackTrace __) {
+        Future<void>.delayed(const Duration(seconds: 2), () async {
+          if (!mounted) return;
+          await _positionStream?.cancel();
+          _positionStream = _locationService.getLocationStream().listen(_onPhoneGnss);
         });
-      });
-    }
+      },
+      cancelOnError: false,
+    );
+
+    try {
+      final initialPos = await _locationService.getCurrentPosition();
+      if (initialPos != null && mounted) {
+        _onPhoneGnss(initialPos);
+      }
+    } catch (_) {}
+  }
+
+  void _moveMapSafely(LatLng target, double zoom) {
+    if (!_mapReady) return;
+    try {
+      _mapController.move(target, zoom);
+    } catch (_) {}
+  }
+
+  void _onPhoneGnss(Position position) {
+    if (!mounted) return;
+    _fullPositionData.value = position;
+    setState(() {
+      _currentPosition = LatLng(position.latitude, position.longitude);
+    });
   }
 
   Future<void> _performRawSearch(String query) async {
@@ -195,6 +214,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     _yaw.dispose();
     _mapController.dispose();
     _rippleController.dispose();
+    _fullPositionData.dispose();
     super.dispose();
   }
 
@@ -234,6 +254,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               initialCenter: _currentPosition ?? const LatLng(28.6139, 77.2090),
               initialZoom: 15.0,
               interactionOptions: const InteractionOptions(flags: InteractiveFlag.all & ~InteractiveFlag.rotate),
+              onMapReady: () {
+                _mapReady = true;
+                if (_currentPosition != null) {
+                  _moveMapSafely(_currentPosition!, 15.0);
+                }
+              },
             ),
             children: [
               TileLayer(
@@ -634,26 +660,29 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   }
 
   Widget _buildGNSSGrid() {
-    final now = DateTime.now();
-    final timeSinceStart = now.difference(_startTime).inSeconds;
-    
-    return GridView.count(
-      crossAxisCount: 2,
-      crossAxisSpacing: 8,
-      mainAxisSpacing: 8,
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      childAspectRatio: 2.0,
-      children: [
-        _buildDataCard('Speed', _fullPositionData != null ? (_fullPositionData!.speed * 3.6).toStringAsFixed(1) : '--', 'km/h'),
-        _buildDataCard('Accuracy', _fullPositionData != null ? _fullPositionData!.accuracy.toStringAsFixed(1) : '--', 'm'),
-        _buildDataCard('Latitude', _fullPositionData != null ? _fullPositionData!.latitude.toStringAsFixed(5) : '--', '°'),
-        _buildDataCard('Longitude', _fullPositionData != null ? _fullPositionData!.longitude.toStringAsFixed(5) : '--', '°'),
-        _buildDataCard('Altitude', _fullPositionData != null ? _fullPositionData!.altitude.toStringAsFixed(1) : '--', 'm'),
-        _buildDataCard('Heading', _fullPositionData != null ? _fullPositionData!.heading.toStringAsFixed(1) : '--', '°'),
-        _buildDataCard('Uptime', '$timeSinceStart', 'sec'),
-        _buildDataCard('Satellites', 'N/A', 'API'),
-      ],
+    return ValueListenableBuilder<Position?>(
+      valueListenable: _fullPositionData,
+      builder: (context, positionData, child) {
+        final timeSinceStart = DateTime.now().difference(_startTime).inSeconds;
+        return GridView.count(
+          crossAxisCount: 2,
+          crossAxisSpacing: 8,
+          mainAxisSpacing: 8,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          childAspectRatio: 2.0,
+          children: [
+            _buildDataCard('Speed', positionData != null ? (positionData.speed * 3.6).toStringAsFixed(1) : '--', 'km/h'),
+            _buildDataCard('Accuracy', positionData != null ? positionData.accuracy.toStringAsFixed(1) : '--', 'm'),
+            _buildDataCard('Latitude', positionData != null ? positionData.latitude.toStringAsFixed(5) : '--', '°'),
+            _buildDataCard('Longitude', positionData != null ? positionData.longitude.toStringAsFixed(5) : '--', '°'),
+            _buildDataCard('Altitude', positionData != null ? positionData.altitude.toStringAsFixed(1) : '--', 'm'),
+            _buildDataCard('Heading', positionData != null ? positionData.heading.toStringAsFixed(1) : '--', '°'),
+            _buildDataCard('Uptime', '$timeSinceStart', 'sec'),
+            _buildDataCard('Satellites', 'N/A', 'API'),
+          ],
+        );
+      },
     );
   }
 
