@@ -1,52 +1,67 @@
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class LocationService {
-  Future<bool> checkAndRequestPermissions() async {
-    bool serviceEnabled;
-    LocationPermission permission;
-
-    // Test if location services are enabled.
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      print('DEBUG: Location services (GPS) are disabled on the device.');
-      return false;
+  LocationSettings _phoneGnssSettings() {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        intervalDuration: const Duration(seconds: 1),
+        forceLocationManager: true,
+        useMSLAltitude: true,
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'Dhuruva INS',
+          notificationText: 'GNSS tracking is active',
+          notificationIcon: AndroidResource(name: 'ic_launcher', defType: 'mipmap'),
+          enableWakeLock: true,
+          setOngoing: true,
+        ),
+      );
     }
 
-    permission = await Geolocator.checkPermission();
-    print('DEBUG: Current permission status is: $permission');
-    
-    if (permission == LocationPermission.denied) {
-      print('DEBUG: Requesting permission...');
-      permission = await Geolocator.requestPermission();
-      print('DEBUG: Permission status after request is: $permission');
-      if (permission == LocationPermission.denied) {
+    return AppleSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      activityType: ActivityType.otherNavigation,
+      distanceFilter: 0,
+      pauseLocationUpdatesAutomatically: false,
+      allowBackgroundLocationUpdates: false,
+    );
+  }
+
+  Future<bool> checkAndRequestPermissions() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      await Geolocator.openLocationSettings();
+      if (!await Geolocator.isLocationServiceEnabled()) {
         return false;
       }
     }
 
-    if (permission == LocationPermission.deniedForever) {
-      print('DEBUG: Permissions are permanently denied. Dialog cannot be shown.');
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
       return false;
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      await Permission.notification.request();
     }
 
     return true;
   }
 
   Stream<Position> getLocationStream() {
-    return Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 1, // update every 1 meter
-      ),
-    );
+    return Geolocator.getPositionStream(locationSettings: _phoneGnssSettings());
   }
 
   Future<Position?> getCurrentPosition() async {
     final hasPermission = await checkAndRequestPermissions();
     if (!hasPermission) return null;
-    return await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
+    return Geolocator.getCurrentPosition(locationSettings: _phoneGnssSettings());
   }
 }
