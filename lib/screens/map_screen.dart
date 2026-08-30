@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -81,6 +83,10 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   final ValueNotifier<double> _yaw = ValueNotifier(0.0);
   DateTime? _lastGyroTime;
   
+  // Telemetry Background Saver
+  Timer? _telemetryTimer;
+  List<Map<String, dynamic>> _jsonTelemetryData = [];
+  
   late AnimationController _rippleController;
 
   @override
@@ -133,6 +139,30 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     _initCacheStore();
     _initLocationTracking();
     _initSensors();
+    
+    // Start background JSON saving timer (every 60 seconds)
+    _telemetryTimer = Timer.periodic(const Duration(seconds: 60), (timer) {
+      _saveTelemetryData();
+    });
+  }
+
+  Future<void> _saveTelemetryData() async {
+    if (_jsonTelemetryData.isEmpty) return;
+    
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/telemetry_latest.json');
+      
+      // We take a snapshot of the list, then clear the main one so it keeps capturing cleanly
+      final dataToSave = List<Map<String, dynamic>>.from(_jsonTelemetryData);
+      _jsonTelemetryData.clear();
+      
+      final jsonString = jsonEncode(dataToSave);
+      await file.writeAsString(jsonString);
+      print("Telemetry saved to ${file.path}");
+    } catch (e) {
+      print("Error saving telemetry: $e");
+    }
   }
 
   void _initSensors() {
@@ -200,6 +230,26 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               newYaw -= gyroRateZ * dt;
           }
           _yaw.value = newYaw;
+          
+          // Capture telemetry continuously for JSON output
+          _jsonTelemetryData.add({
+            "timestamp": now.millisecondsSinceEpoch,
+            "gps": {
+              "lat": _currentPosition?.latitude,
+              "lon": _currentPosition?.longitude,
+              "speed": _fullPositionData.value?.speed ?? 0.0,
+            },
+            "imu": {
+              "accel": {"x": _accel.value?.x, "y": _accel.value?.y, "z": _accel.value?.z},
+              "gyro": {"x": event.x, "y": event.y, "z": event.z},
+              "mag": {"x": _mag.value?.x, "y": _mag.value?.y, "z": _mag.value?.z}
+            },
+            "orientation": {
+              "pitch": _pitch.value,
+              "roll": _roll.value,
+              "yaw": _yaw.value
+            }
+          });
         }
         _lastGyroTime = now;
     });
@@ -260,7 +310,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     _hasPrefetchedHome = true;
 
     final Set<String> tilesToDownload = {};
-    for (int z = 13; z <= 16; z++) {
+    for (int z = 14; z <= 16; z++) {
       final n = math.pow(2, z);
       final latRad = _currentPosition!.latitude * math.pi / 180;
       final centerX = ((_currentPosition!.longitude + 180.0) / 360.0 * n).floor();
@@ -269,13 +319,16 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       // 3x3 grid around center tile to cover >500m radius
       for (int dx = -1; dx <= 1; dx++) {
         for (int dy = -1; dy <= 1; dy++) {
-          tilesToDownload.add('https://tile.openstreetmap.org///.png');
+          tilesToDownload.add('https://tile.openstreetmap.org/$z/${centerX + dx}/${centerY + dy}.png');
         }
       }
     }
 
     for (var url in tilesToDownload) {
-      try { await _dio!.get(url); } catch (_) {}
+      try { 
+        await _dio!.get(url); 
+        await Future.delayed(const Duration(milliseconds: 50));
+      } catch (_) {}
     }
   }
 
@@ -287,8 +340,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     });
 
     final Set<String> tilesToDownload = {};
-    for (var point in _routePoints) {
-      for (int z = 13; z <= 16; z++) {
+    for (int i = 0; i < _routePoints.length; i += 20) {
+      final point = _routePoints[i];
+      for (int z = 14; z <= 16; z++) {
         final n = math.pow(2, z);
         final latRad = point.latitude * math.pi / 180;
         final x = ((point.longitude + 180.0) / 360.0 * n).floor();
@@ -302,6 +356,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     for (var url in tilesToDownload) {
       try {
         await _dio!.get(url);
+        await Future.delayed(const Duration(milliseconds: 50));
       } catch (_) {}
       completed++;
       if (mounted) {
@@ -331,6 +386,42 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     } catch (_) {
       return '';
     }
+  }
+
+  List<LatLng> _generateCurve(LatLng start, LatLng end) {
+    List<LatLng> curvePoints = [];
+    double midLat = (start.latitude + end.latitude) / 2;
+    double midLng = (start.longitude + end.longitude) / 2;
+    double dLat = end.latitude - start.latitude;
+    double dLng = end.longitude - start.longitude;
+    double controlLat = midLat - (dLng * 0.2);
+    double controlLng = midLng + (dLat * 0.2);
+    for (double t = 0; t <= 1; t += 0.05) {
+      double lat = (1 - t) * (1 - t) * start.latitude + 2 * (1 - t) * t * controlLat + t * t * end.latitude;
+      double lng = (1 - t) * (1 - t) * start.longitude + 2 * (1 - t) * t * controlLng + t * t * end.longitude;
+      curvePoints.add(LatLng(lat, lng));
+    }
+    // Add the final point to ensure it connects perfectly
+    curvePoints.add(end);
+    return curvePoints;
+  }
+
+  Widget _buildEtaCard(IconData icon, String time, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 24),
+          const SizedBox(width: 8),
+          Text(time, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 16)),
+        ],
+      ),
+    );
   }
 
   void _onPhoneGnss(Position position) {
@@ -443,7 +534,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
   @override
   void dispose() {
-
+    _telemetryTimer?.cancel();
     _internetSub?.cancel();
     _flutterTts.stop();
     _positionStream?.cancel();
@@ -547,10 +638,15 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               if (_routePoints.isNotEmpty)
                 PolylineLayer(
                   polylines: [
+                    if (_currentPosition != null && _routePoints.isNotEmpty)
+                      Polyline(
+                        points: _generateCurve(_currentPosition!, _routePoints.first),
+                        color: Colors.blue.shade400,
+                        strokeWidth: 4.0,
+                        pattern: const StrokePattern.dotted(),
+                      ),
                     Polyline(
-                      points: _isActiveRouting && _currentPosition != null && _routePoints.isNotEmpty
-                          ? [_currentPosition!, if (_routePoints.length > 1) ..._routePoints.sublist(1) else _routePoints[0]]
-                          : _routePoints,
+                      points: _routePoints,
                       color: Colors.blue.shade600,
                       strokeWidth: 6.0,
                     ),
