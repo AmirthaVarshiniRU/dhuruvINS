@@ -11,6 +11,8 @@ import '../services/location_service.dart';
 import '../services/geocoding_service.dart';
 import '../services/routing_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+import '../services/wikipedia_service.dart';
 import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:dio/dio.dart';
@@ -57,6 +59,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   double _downloadProgress = 0.0;
   
   final FlutterTts _flutterTts = FlutterTts();
+  final SpeechToText _speechToText = SpeechToText();
+  final WikipediaService _wikipediaService = WikipediaService();
+  bool _isListening = false;
+  
+  PlaceDetails? _placeDetails;
+  bool _isLoadingDetails = false;
 
   
   LatLng? _currentPosition;
@@ -139,6 +147,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     _initCacheStore();
     _initLocationTracking();
     _initSensors();
+    _initSpeech();
     
     // Start background JSON saving timer (every 60 seconds)
     _telemetryTimer = Timer.periodic(const Duration(seconds: 60), (timer) {
@@ -163,6 +172,33 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     } catch (e) {
       print("Error saving telemetry: $e");
     }
+  }
+
+  Future<void> _initSpeech() async {
+    await _speechToText.initialize();
+  }
+
+  void _startListening(TextEditingController controller) async {
+    if (!_isListening) {
+      bool available = await _speechToText.initialize();
+      if (available) {
+        setState(() => _isListening = true);
+        _speechToText.listen(
+          onResult: (result) {
+            controller.text = result.recognizedWords;
+            if (result.finalResult) {
+              setState(() => _isListening = false);
+              _performRawSearch(controller.text);
+            }
+          },
+        );
+      }
+    }
+  }
+
+  void _stopListening() async {
+    await _speechToText.stop();
+    setState(() => _isListening = false);
   }
 
   void _initSensors() {
@@ -712,42 +748,45 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
             ],
           ),
           
-          if (!_isActiveRouting && !_isAutoTracking)
-          // RE-CENTER BUTTON
-          Positioned(
-            top: 20,
-            right: 20,
-            child: FloatingActionButton(
-              mini: true,
-              backgroundColor: Colors.blue.shade800,
-              foregroundColor: Colors.white,
-              elevation: 4,
-              onPressed: () {
-                setState(() => _isAutoTracking = true);
-                if (_currentPosition != null) {
-                  _mapController.moveAndRotate(_currentPosition!, 16.0, 0.0);
-                }
-              },
-              child: const Icon(Icons.my_location, size: 20),
-            ),
-          ),
-          
-          // COMPASS BUTTON (Normal Mode)
+          // RE-CENTER & COMPASS BUTTONS (Normal Mode)
           if (!_isActiveRouting)
             Positioned(
-              top: 70,
+              bottom: _destination != null ? MediaQuery.of(context).size.height * 0.42 : 30,
               right: 20,
-              child: FloatingActionButton(
-                mini: true,
-                backgroundColor: Colors.white,
-                foregroundColor: Colors.black87,
-                elevation: 4,
-                onPressed: () {
-                  if (_currentPosition != null) {
-                    _mapController.rotate(0.0);
-                  }
-                },
-                child: const Icon(Icons.explore, size: 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  FloatingActionButton(
+                    mini: true,
+                    heroTag: 'compass_btn',
+                    backgroundColor: Colors.white,
+                    foregroundColor: Colors.black87,
+                    elevation: 4,
+                    onPressed: () {
+                      if (_currentPosition != null) {
+                        _mapController.rotate(0.0);
+                      }
+                    },
+                    child: const Icon(Icons.explore, size: 20),
+                  ),
+                  if (!_isAutoTracking) ...[
+                    const SizedBox(height: 12),
+                    FloatingActionButton(
+                      mini: true,
+                      heroTag: 'recenter_btn',
+                      backgroundColor: Colors.blue.shade800,
+                      foregroundColor: Colors.white,
+                      elevation: 4,
+                      onPressed: () {
+                        setState(() => _isAutoTracking = true);
+                        if (_currentPosition != null) {
+                          _mapController.moveAndRotate(_currentPosition!, 16.0, 0.0);
+                        }
+                      },
+                      child: const Icon(Icons.my_location, size: 20),
+                    ),
+                  ],
+                ],
               ),
             ),
 
@@ -778,7 +817,19 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                 setState(() {
                   _destination = selection.coordinates;
                   _destinationName = selection.name;
+                  _placeDetails = null;
+                  _isLoadingDetails = true;
                 });
+                
+                _wikipediaService.getPlaceDetails(selection.coordinates).then((details) {
+                  if (mounted) {
+                    setState(() {
+                      _placeDetails = details;
+                      _isLoadingDetails = false;
+                    });
+                  }
+                });
+
                 _mapController.move(selection.coordinates, 14.0);
                 FocusManager.instance.primaryFocus?.unfocus();
               },
@@ -798,24 +849,39 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                       suffixIcon: ValueListenableBuilder<TextEditingValue>(
                         valueListenable: textEditingController,
                         builder: (context, value, child) {
-                          if (value.text.isEmpty) {
-                            return IconButton(
-                              icon: const Icon(Icons.search, color: Colors.blue),
-                              onPressed: () {
-                                _performRawSearch(textEditingController.text);
-                              },
-                            );
-                          } else {
-                            return IconButton(
-                              icon: const Icon(Icons.close, color: Colors.grey),
-                              onPressed: () {
-                                textEditingController.clear();
-                                setState(() {
-                                  _destination = null;
-                                });
-                              },
-                            );
-                          }
+                          return Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: Icon(_isListening ? Icons.mic : Icons.mic_none, color: _isListening ? Colors.red : Colors.grey),
+                                onPressed: () {
+                                  if (_isListening) {
+                                    _stopListening();
+                                  } else {
+                                    _startListening(textEditingController);
+                                  }
+                                },
+                              ),
+                              if (value.text.isEmpty)
+                                IconButton(
+                                  icon: const Icon(Icons.search, color: Colors.blue),
+                                  onPressed: () {
+                                    _performRawSearch(textEditingController.text);
+                                  },
+                                )
+                              else
+                                IconButton(
+                                  icon: const Icon(Icons.close, color: Colors.grey),
+                                  onPressed: () {
+                                    textEditingController.clear();
+                                    setState(() {
+                                      _destination = null;
+                                      _placeDetails = null;
+                                    });
+                                  },
+                                ),
+                            ],
+                          );
                         },
                       ),
                     ),
@@ -927,9 +993,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
           // BOTTOM SHEET FOR DESTINATION INFO
           if (_destination != null)
             DraggableScrollableSheet(
-              initialChildSize: _isActiveRouting ? 0.22 : 0.38,
+              initialChildSize: _isActiveRouting ? 0.22 : 0.45,
               minChildSize: 0.1,
-              maxChildSize: _isActiveRouting ? 0.22 : 0.5,
+              maxChildSize: _isActiveRouting ? 0.22 : 0.7,
               snap: true,
               builder: (context, scrollController) {
                 return Container(
@@ -956,6 +1022,22 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                           ),
                           if (_routePoints.isEmpty) ...[
                             // State 1: Selection Mode
+                            
+                            // Wikipedia Image
+                            if (_placeDetails?.imageUrl != null)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 16),
+                                width: double.infinity,
+                                height: 160,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(16),
+                                  image: DecorationImage(
+                                    image: NetworkImage(_placeDetails!.imageUrl!),
+                                    fit: BoxFit.cover,
+                                  ),
+                                ),
+                              ),
+                              
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -975,6 +1057,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                   onPressed: () {
                                     setState(() {
                                       _destination = null;
+                                      _placeDetails = null;
                                       _routePoints.clear();
                                       _eta = '';
                                       _distance = '';
@@ -985,7 +1068,23 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 24),
+                            const SizedBox(height: 16),
+                            if (_isLoadingDetails)
+                              const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 8.0),
+                                child: Center(child: CircularProgressIndicator()),
+                              )
+                            else if (_placeDetails != null)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 16.0),
+                                child: Text(
+                                  _placeDetails!.summary,
+                                  style: TextStyle(fontSize: 15, color: Colors.grey.shade800, height: 1.4),
+                                  maxLines: 5,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            const SizedBox(height: 16),
                             Row(
                               children: [
                                 Expanded(
@@ -1075,14 +1174,18 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                   child: Column(
                                     crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
-                                      Row(
-                                        crossAxisAlignment: CrossAxisAlignment.baseline,
-                                        textBaseline: TextBaseline.alphabetic,
-                                        children: [
-                                          Text(_eta, style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Color(0xFF4CAF50))),
-                                          const SizedBox(width: 12),
-                                          Text(_distance, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600, color: Colors.blue)),
-                                        ],
+                                      FittedBox(
+                                        fit: BoxFit.scaleDown,
+                                        alignment: Alignment.centerLeft,
+                                        child: Row(
+                                          crossAxisAlignment: CrossAxisAlignment.baseline,
+                                          textBaseline: TextBaseline.alphabetic,
+                                          children: [
+                                            Text(_eta, style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: Color(0xFF4CAF50))),
+                                            const SizedBox(width: 12),
+                                            Text(_distance, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600, color: Colors.blue)),
+                                          ],
+                                        ),
                                       ),
                                       const SizedBox(height: 12),
                                       Text('Navigating to: $_destinationName', style: TextStyle(color: Colors.grey.shade600, fontSize: 18)),
